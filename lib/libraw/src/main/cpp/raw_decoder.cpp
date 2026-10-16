@@ -20,6 +20,7 @@
  * compile the real SFRAW_HAVE_LIBRAW decode path.
  */
 #include "raw_decoder.h"
+#include "raw_input_snapshot.h"
 #include "raw_decode_budget.h"
 
 #include <algorithm>
@@ -1138,8 +1139,7 @@ constexpr unsigned kMaxRawMemoryMb = 128;
 // replaces the fd slurp with a seekable/tiled datastream before larger future
 // RAWs can be admitted without making encoded bytes an unbounded allocation.
 constexpr size_t kMaxEncodedInputBytes = 64U * 1024U * 1024U;
-// Non-Bayer/linear DNG layouts may ignore half_size. Use the same selected
-// limit for all phases of one decode, including its post-unpack checks.
+// Keep one selected output limit for every phase of a decode.
 uint64_t currentDecodePixelLimit() {
     uint64_t totalBytes = 0;
     uint64_t availableBytes = 0;
@@ -1247,9 +1247,8 @@ bool stretchedDimensionsExceedLimit(const libraw_image_sizes_t& sizes,
                                static_cast<uint64_t>(projectedHeight), limit);
 }
 
-bool declaredDecodeDimensionsExceedLimit(const LibRaw& raw,
+bool declaredDecodeDimensionsExceedLimit(const libraw_image_sizes_t& sizes,
                                          uint64_t pixelLimit) {
-    const auto& sizes = raw.imgdata.sizes;
     // LibRaw::unpack() may expand its raw-store dimensions to include active
     // area margins even when raw_width*raw_height and width*height are each
     // individually below the limit. Mirror that allocation geometry with
@@ -1267,6 +1266,44 @@ bool declaredDecodeDimensionsExceedLimit(const LibRaw& raw,
            pixelProductExceeds(allocationWidth, allocationHeight,
                                pixelLimit) ||
            stretchedDimensionsExceedLimit(sizes, pixelLimit);
+}
+
+bool largeBayerHalfAllowed(LibRaw& raw, const DecodeOptions& options,
+                           uint64_t pixelLimit, bool afterUnpack) {
+    // raw2image_start() restores these snapshots before choosing IO.shrink.
+    const auto& s = afterUnpack ? raw.imgdata.rawdata.sizes : raw.imgdata.sizes;
+    const auto& id = afterUnpack ? raw.imgdata.rawdata.iparams : raw.imgdata.idata;
+    const auto& data = raw.imgdata.rawdata;
+    const bool singleRawPlane = !afterUnpack ||
+        (data.raw_image != nullptr && data.color3_image == nullptr &&
+         data.color4_image == nullptr && data.float_image == nullptr &&
+         data.float3_image == nullptr && data.float4_image == nullptr);
+    return qualifiedLargeBayerHalfGeometry(
+        {s.raw_width, s.raw_height, s.width, s.height,
+         s.left_margin, s.top_margin, s.pixel_aspect}, pixelLimit,
+        options.halfSize, id.filters, id.colors,
+        afterUnpack ? data.ioparams.fuji_width
+                    : raw.get_internal_data_pointer()->internal_output_params.fuji_width,
+        singleRawPlane);
+}
+
+bool decodeGeometryExceedsLimit(LibRaw& raw,
+                                const DecodeOptions& options,
+                                uint64_t pixelLimit, bool afterUnpack) {
+    const bool currentTooLarge =
+        declaredDecodeDimensionsExceedLimit(raw.imgdata.sizes, pixelLimit);
+    const bool restoredTooLarge = afterUnpack &&
+        declaredDecodeDimensionsExceedLimit(raw.imgdata.rawdata.sizes,
+                                            pixelLimit);
+    return (currentTooLarge || restoredTooLarge) &&
+           !largeBayerHalfAllowed(raw, options, pixelLimit, afterUnpack);
+}
+
+void selectRawStoreLimit(LibRaw& raw, const DecodeOptions& options,
+                         uint64_t pixelLimit) {
+    if (declaredDecodeDimensionsExceedLimit(raw.imgdata.sizes, pixelLimit) &&
+        largeBayerHalfAllowed(raw, options, pixelLimit, false))
+        raw.imgdata.rawparams.max_raw_memory_mb = kLargeBayerRawStoreMiB;
 }
 
 DecodeResult dimensionLimitFailure(uint64_t pixelLimit) {
@@ -2201,7 +2238,7 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
     // Some loaders finalize or replace image geometry during unpack(). Re-run
     // the same overflow-safe raw/visible/margin/aspect guard before any
     // dcraw_process() allocation instead of trusting identify-time dimensions.
-    if (declaredDecodeDimensionsExceedLimit(raw, pixelLimit)) {
+    if (decodeGeometryExceedsLimit(raw, options, pixelLimit, true)) {
         return dimensionLimitFailure(pixelLimit);
     }
     const dngsniff::PrimaryImageInfo finalizedSource =
@@ -2440,9 +2477,10 @@ DecodeResult decodeFromBuffer(const uint8_t* data, size_t length,
                        libraw_strerror(rc) + " (unsupported or corrupt RAW)";
         return result;
     }
-    if (declaredDecodeDimensionsExceedLimit(raw, pixelLimit)) {
+    if (decodeGeometryExceedsLimit(raw, options, pixelLimit, false)) {
         return dimensionLimitFailure(pixelLimit);
     }
+    selectRawStoreLimit(raw, options, pixelLimit);
     return finishDecode(raw, options, data, length, decodeStartedAt, 0.0,
                         openMs, pixelLimit);
 } catch (const std::bad_alloc&) {
@@ -2469,6 +2507,47 @@ DecodeResult decodeFromFd(int fd, const DecodeOptions& options) try {
         result.status = SFRAW_ERR_INPUT;
         result.error = "invalid file descriptor";
         return result;
+    }
+    if (options.inputScratchFd >= 0) {
+        // Declaration order matters: LibRaw may retain open_buffer pointers,
+        // so its destructor must run before the mapped snapshot is unmapped.
+        RawInputSnapshot snapshot;
+        const auto ioAt = std::chrono::steady_clock::now();
+        if (!snapshot.load(fd, options.inputScratchFd, options, &result))
+            return result;
+        const double inputIoMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - ioAt).count();
+        const uint8_t* data = snapshot.data();
+        const size_t length = snapshot.size();
+        if (!preflightLibRawOpen(data, length, &result)) return result;
+        LibRaw raw;
+        applyInputLimits(raw);
+        applyCancellationHandler(raw, options);
+        const auto openAt = std::chrono::steady_clock::now();
+#if defined(SFRAW_TESTING)
+        sfraw::test::notifyLibRawOpenAttemptForTest();
+#endif
+        const int rc = raw.open_buffer(const_cast<uint8_t*>(data), length);
+        const double openMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - openAt).count();
+        if (rc == LIBRAW_CANCELLED_BY_CALLBACK) return cancellationFailure(rc);
+        if (cancellationRequested(options)) return cancellationFailure();
+        if (rc != LIBRAW_SUCCESS) {
+            result.librawCode = rc;
+            const int codecFallback = dngsniff::classifyOpenFailure(data, length);
+            result.status = isMemoryLimitFailure(rc) ? SFRAW_ERR_NO_MEMORY
+                : (codecFallback != SFRAW_ERR_UNPACK ? codecFallback
+                : (rc == LIBRAW_FILE_UNSUPPORTED ? SFRAW_ERR_FILE_UNSUPPORTED
+                                                  : SFRAW_ERR_OPEN));
+            result.error = std::string("LibRaw open_buffer() failed: ") +
+                           libraw_strerror(rc) + " (unsupported or corrupt RAW)";
+            return result;
+        }
+        if (decodeGeometryExceedsLimit(raw, options, pixelLimit, false))
+            return dimensionLimitFailure(pixelLimit);
+        selectRawStoreLimit(raw, options, pixelLimit);
+        return finishDecode(raw, options, data, length, decodeStartedAt,
+                            inputIoMs, openMs, pixelLimit);
     }
     LibRaw raw;
     applyInputLimits(raw);
@@ -2547,9 +2626,10 @@ DecodeResult decodeFromFd(int fd, const DecodeOptions& options) try {
                        libraw_strerror(rc) + " (unsupported or corrupt RAW)";
         return result;
     }
-    if (declaredDecodeDimensionsExceedLimit(raw, pixelLimit)) {
+    if (decodeGeometryExceedsLimit(raw, options, pixelLimit, false)) {
         return dimensionLimitFailure(pixelLimit);
     }
+    selectRawStoreLimit(raw, options, pixelLimit);
     return finishDecode(raw, options, bytes.data(), bytes.size(),
                         decodeStartedAt, inputIoMs, openMs, pixelLimit);
 } catch (const std::bad_alloc&) {

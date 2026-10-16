@@ -45,8 +45,8 @@ android {
         applicationId = "com.spectrafilm.app.local"
         minSdk = 24
         targetSdk = 36
-        versionCode = 13
-        versionName = "0.10.0-local.2"
+        versionCode = 15
+        versionName = "0.10.0-local.4"
         testInstrumentationRunner = "com.spectrafilm.app.ReleaseCandidateSmokeInstrumentation"
         ndk { abiFilters += providers.gradleProperty("localAbis").orElse("arm64-v8a,armeabi-v7a,x86_64").get().split(",") }
     }

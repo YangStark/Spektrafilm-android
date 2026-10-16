@@ -64,10 +64,11 @@ struct DecodeOptions {
     //     reported by LibRaw for the full-res image (LibRaw updates imgdata.sizes
     //     accordingly; `dcraw_make_mem_image` reports the post-process dimensions).
     //
-    // The in-memory safety gate is evaluated before unpack even in half-size
-    // mode: 8 MiPixels on 32-bit, and 12/24/32 MiPixels on 64-bit according to
-    // device RAM. Non-Bayer layouts may ignore half_size. Default false
-    // requests full-resolution output within the selected limit.
+    // The processed-image limit remains 8/12/24/32 MiPixels according to
+    // device RAM. On the 32 MiPixel device tier, a qualified single-plane
+    // Bayer half-size decode may admit up to 128 MiPixels of sensor geometry;
+    // its unpacked RAW store remains bounded separately. Other layouts retain
+    // the ordinary geometry limit. Default false requests full resolution.
     bool halfSize = false;
 
     // Hard cap on the output's longest edge (pixels). 0 = no cap. When > 0 and the
@@ -85,6 +86,14 @@ struct DecodeOptions {
     // polls before and after those noninterruptible phases and throughout its own
     // fd-read, copy, adaptation, and colour-conversion loops.
     const std::atomic<bool>* cancelFlag = nullptr;
+
+    // Optional caller-owned, private, empty, unlinked temporary regular file
+    // opened O_RDWR. With a valid fd, decodeFromFd copies the source into this
+    // file (512 MiB maximum on 64-bit, 64 MiB on 32-bit), then decodes a
+    // read-only private mapping. The caller must keep it open and unchanged
+    // until decodeFromFd returns; the decoder duplicates it and never closes
+    // the caller's descriptor. -1 keeps the legacy 64 MiB buffered path.
+    int inputScratchFd = -1;
 };
 
 // Stable decode status codes. These cross to Kotlin (RawDecoder.DecodeStatus)

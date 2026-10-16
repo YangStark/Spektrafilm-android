@@ -67,6 +67,35 @@ int main() {
   check(spectrafilm::decodePixelLimitForMemory(true, 0, 0) == 12 * kMiB,
         "unavailable memory telemetry falls back to 12 MiPixels");
 
+  using spectrafilm::DecodeGeometry;
+  const DecodeGeometry gfx100{11648, 8736, 11648, 8736, 0, 0, 1.0};
+  const auto allowed = [](const DecodeGeometry& geometry,
+                          std::uint64_t cap, bool half, unsigned filters,
+                          unsigned colors, unsigned fuji, bool rawPlane) {
+    return spectrafilm::qualifiedLargeBayerHalfGeometry(
+        geometry, cap, half, filters, colors, fuji, rawPlane);
+  };
+  check(allowed(gfx100, 32 * kMiB, true, 0x94949494U, 3, 0, true),
+        "102 MP Bayer admits a bounded half-size decode");
+  check(!allowed(gfx100, 32 * kMiB, false, 0x94949494U, 3, 0, true) &&
+            !allowed(gfx100, 24 * kMiB, true, 0x94949494U, 3, 0, true) &&
+            !allowed(gfx100, 8 * kMiB, true, 0x94949494U, 3, 0, true),
+        "full-size and lower RAM tiers cannot use large-Bayer admission");
+  check(!allowed(gfx100, 32 * kMiB, true, 9, 3, 0, true) &&
+            !allowed(gfx100, 32 * kMiB, true, 0, 3, 0, true) &&
+            !allowed(gfx100, 32 * kMiB, true, UINT32_MAX, 3, 0, true) &&
+            !allowed(gfx100, 32 * kMiB, true, 0x94949494U, 4, 0, true) &&
+            !allowed(gfx100, 32 * kMiB, true, 0x94949494U, 3, 1, true) &&
+            !allowed(gfx100, 32 * kMiB, true, 0x94949494U, 3, 0, false),
+        "X-Trans, linear, unknown, rotated and multi-plane RAW reject expansion");
+  check(!allowed({13000, 11000, 13000, 11000, 0, 0, 1.0},
+                 32 * kMiB, true, 0x94949494U, 3, 0, true) &&
+            !allowed({12000, 10000, 12000, 10000, 0, 0, 0.5},
+                     32 * kMiB, true, 0x94949494U, 3, 0, true) &&
+            !allowed({12000, 10000, 12000, 10000, UINT64_MAX, 0, 1.0},
+                     32 * kMiB, true, 0x94949494U, 3, 0, true),
+        "source area, aspect expansion and margin overflow remain bounded");
+
   spectrafilm::DecodeOptions options;
 
   std::atomic<bool> preCancelled{true};
