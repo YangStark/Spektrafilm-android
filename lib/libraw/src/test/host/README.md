@@ -6,8 +6,9 @@ drives hostile bytes only through LibRaw's supported public sequence:
 `open_buffer` -> `unpack` -> `dcraw_process`.
 
 The default build instruments both LibRaw and the tests with AddressSanitizer
-and UndefinedBehaviorSanitizer. It caps each input at 16 MiB, LibRaw raw-memory
-allocations at 128 MiB, and declared/adjusted/stretched frames at 12 MiPixels.
+and UndefinedBehaviorSanitizer. Its direct LibRaw harness caps each input at
+16 MiB, raw-memory allocations at 128 MiB, and declared/adjusted/stretched
+frames at 12 MiPixels.
 The regression covers
 the exact 64-byte input from upstream issue #844 plus project-owned
 lossless-JPEG DNGs whose valid SOF3/DHT/SOS headers cover truncated entropy, an
@@ -16,8 +17,8 @@ CR2Slice geometry (CVE-2026-21413). A positive uncompressed DNG control reaches
 all three public stages (and the wavelet path when OpenMP is available). A
 compile-time and runtime assertion prevents a 0.21.x library from satisfying
 the test. The production-wrapper CTest also exercises the 64 MiB encoded-input,
-128 MiB raw-store, 12/8 MiPixel, ActiveArea, DefaultScale, ICC, and cumulative
-metadata guards with positive controls.
+128 MiB raw-store, device-RAM-based 8/12/24/32 MiPixel admission policy,
+ActiveArea, DefaultScale, ICC, and cumulative metadata guards with positive controls.
 
 The same CTest project runs `sfraw.raw-wb.cat02-exact-bits`. Its fixture header
 is generated in the build directory from

@@ -64,10 +64,10 @@ struct DecodeOptions {
     //     reported by LibRaw for the full-res image (LibRaw updates imgdata.sizes
     //     accordingly; `dcraw_make_mem_image` reports the post-process dimensions).
     //
-    // The current in-memory safety gate is evaluated before unpack and remains
-    // 12 MiPixels on 64-bit / 8 MiPixels on 32-bit even in half-size mode;
-    // non-Bayer layouts may ignore half_size. Ticket #173 owns tiled high-MP decode.
-    // Default false requests full-resolution output within those limits.
+    // The in-memory safety gate is evaluated before unpack even in half-size
+    // mode: 8 MiPixels on 32-bit, and 12/24/32 MiPixels on 64-bit according to
+    // device RAM. Non-Bayer layouts may ignore half_size. Default false
+    // requests full-resolution output within the selected limit.
     bool halfSize = false;
 
     // Hard cap on the output's longest edge (pixels). 0 = no cap. When > 0 and the

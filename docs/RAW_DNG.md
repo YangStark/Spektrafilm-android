@@ -298,5 +298,17 @@ without exhausting the ~256 MB managed heap:
    explicitly through `LinearImage` / `SimResult` (`AutoCloseable`). Preview-scale buffers stay
    managed so the preview cache lifecycle is unchanged.
 
+Native full-resolution decode admission also checks declared, adjusted, and
+processed geometry against one pixel limit chosen at the start of each decode.
+The limit is 8 MiPixels on 32-bit devices. On 64-bit devices it is 12 MiPixels
+by default, 24 MiPixels with at least 6 GiB total and 2 GiB available RAM, or
+32 MiPixels with at least 8 GiB total and 3 GiB available RAM. Missing or
+inconsistent memory information keeps the 12 MiPixel baseline. The 32 MiPixel
+ceiling is 33,554,432 pixels; it is a budget threshold, not evidence that a
+33-megapixel camera file has passed device testing. The 64 MiB encoded-input
+and 128 MiB LibRaw raw-store caps remain in force. This heuristic governs RAW
+decode admission only; it does not guarantee that the later engine and export
+allocations will succeed.
+
 The original study behind this (Lightroom's `libLrAndroid.so` evidence, `RESEARCH_BIG_FILES.md`)
 was removed from the tree on 2026-09-14; git history keeps it.
