@@ -359,6 +359,38 @@ int main() {
               "active micro-structure is refused, byte-for-byte");
     }
 
+    // Row slicing must preserve the exact GPU realisation, including reflected
+    // borders, nonuniform densities, and a halo wider than an output slice.
+    {
+        constexpr uint32_t w = 129, h = 137;
+        std::vector<float> input(static_cast<size_t>(w) * h * 3u);
+        for (size_t i = 0; i < input.size(); ++i)
+            input[i] = 0.02f + 0.6f * static_cast<float>((i * 17u) % 257u) / 257.0f;
+        std::vector<spk::gpu::GrainCell> cc;
+        for (int c = 0; c < 3; ++c) {
+            auto cell = make_cell(c, 17u + c, kNppp);
+            cell.blur_sigma_px = c == 0 ? 0.0 : (c == 1 ? 0.4 : 0.9);
+            cc.push_back(cell);
+        }
+        spk::gpu::GrainSampleRequest r;
+        r.width = w; r.height = h; r.npix = w * h;
+        r.cell_count = 3; r.cells = cc.data(); r.density_cells = input.data();
+        r.seed_offset = 57;
+        std::vector<float> whole(input.size(), -1.0f), sliced(input.size(), -2.0f);
+        spk::gpu::GrainSampleDiagnostics full, part;
+        check(spk::gpu::grain_sample(r, whole.data(), &full) && full.engaged,
+              "whole-frame grain seam reference engaged");
+        for (uint32_t rows : {1u, 17u, 73u}) {
+            r.max_slice_rows = rows;
+            const bool ran = spk::gpu::grain_sample(r, sliced.data(), &part);
+            check(ran && part.engaged && part.slices == (h + rows - 1u) / rows,
+                  "forced row slicing actually engaged");
+            check(sliced == whole, "row-sliced grain is byte-identical across blur seams");
+            check(part.out_of_branch == full.out_of_branch,
+                  "sliced branch count excludes duplicated halo samples");
+        }
+    }
+
     if (g_failures == 0) {
         std::printf("test_grain_gpu: ALL OK\n");
         return 0;

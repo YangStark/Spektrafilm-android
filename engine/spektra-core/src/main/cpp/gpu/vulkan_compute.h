@@ -309,7 +309,7 @@ struct GrainCell {
 
 struct GrainSampleRequest {
     // npix * cell_count floats, index p * cell_count + k, matching `cells`.
-    // WHOLE FRAME: the dye-cloud blur reads neighbours, so this is not sliced.
+    // Caller supplies the whole frame; bounded GPU uploads include blur halos.
     const float* density_cells = nullptr;
     const GrainCell* cells = nullptr;
     int cell_count = 0;
@@ -317,6 +317,8 @@ struct GrainSampleRequest {
     uint32_t height = 0;    // npix == width * height
     uint32_t npix = 0;
     uint32_t seed_offset = 0;
+    // Optional smaller row limit for seam-invariance testing; 0 uses device policy.
+    uint32_t max_slice_rows = 0;
 };
 
 struct GrainSampleDiagnostics {

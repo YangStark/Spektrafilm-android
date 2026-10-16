@@ -48,8 +48,8 @@
 layout(local_size_x = WG) in;
 
 // density_cmy_layers, npix * ncells, index p * ncells + k. k is the flattened
-// (sublayer, channel) cell in the host's order. WHOLE FRAME, not a slice -- the
-// blur reads neighbours, so a sliced upload would need a halo.
+// (sublayer, channel) cell in the host's order. The uploaded row band includes
+// its blur halo; global coordinates are translated only for buffer addressing.
 layout(std430, binding = 0) readonly  buffer InBuf  { float density[]; };
 // Accumulated grain, npix * 3. The host does the /n_sub, the -= density_min and
 // the final blur: those are frame-level parameters, not per-pixel work.
@@ -67,6 +67,8 @@ layout(push_constant) uniform Push {
     uint groups_x;      // 2D dispatch flattened to one pixel index
     uint width;
     uint height;
+    uint input_pixel_base;
+    uint output_pixel_base;
 } pc;
 
 // PCG-RXS-M-XS, 32-bit (O'Neill). Counter-based: no state, so a sample depends
@@ -112,7 +114,7 @@ float sample_cell(uint k, uint gp, uint b, bool count, inout uint outside) {
     // probability_of_development, clipped exactly as grain.py does. The clip
     // keeps p strictly inside (0,1), so the CPU's p<=0 and p>=1 early-outs are
     // unreachable and need no branch here.
-    float d = density[gp * pc.ncells + k] + dmin;
+    float d = density[(gp - pc.input_pixel_base) * pc.ncells + k] + dmin;
     float pr = clamp(d / dmax, 1e-6, 1.0 - 1e-6);
     float sat = 1.0 - pr * uni * (1.0 - 1e-6);
     float lam = n_ppp / sat;
@@ -144,8 +146,9 @@ float sample_cell(uint k, uint gp, uint b, bool count, inout uint outside) {
 
 void main() {
     uint group = gl_WorkGroupID.y * pc.groups_x + gl_WorkGroupID.x;
-    uint p = group * WG + gl_LocalInvocationID.x;
-    if (p >= pc.npix) return;
+    uint local_p = group * WG + gl_LocalInvocationID.x;
+    if (local_p >= pc.npix) return;
+    uint p = local_p + pc.output_pixel_base;
 
     int w = int(pc.width);
     int h = int(pc.height);
@@ -191,9 +194,9 @@ void main() {
         acc[ch] += g;
     }
 
-    grain_out[p * 3u + 0u] = acc[0];
-    grain_out[p * 3u + 1u] = acc[1];
-    grain_out[p * 3u + 2u] = acc[2];
+    grain_out[local_p * 3u + 0u] = acc[0];
+    grain_out[local_p * 3u + 1u] = acc[1];
+    grain_out[local_p * 3u + 2u] = acc[2];
     // One atomic per pixel at most, and only when something fell outside.
     if (outside > 0u) atomicAdd(counters.out_of_branch, outside);
 }

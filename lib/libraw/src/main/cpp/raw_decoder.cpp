@@ -20,6 +20,7 @@
  * compile the real SFRAW_HAVE_LIBRAW decode path.
  */
 #include "raw_decoder.h"
+#include "raw_decode_budget.h"
 
 #include <algorithm>
 #include <array>
@@ -1137,15 +1138,31 @@ constexpr unsigned kMaxRawMemoryMb = 128;
 // replaces the fd slurp with a seekable/tiled datastream before larger future
 // RAWs can be admitted without making encoded bytes an unbounded allocation.
 constexpr size_t kMaxEncodedInputBytes = 64U * 1024U * 1024U;
-// LibRaw's raw-store budget does not include every later dcraw_process(),
-// dcraw_make_mem_image(), and float-result allocation. Bound metadata-declared
-// pixels before unpack() as an immediate mobile-safe policy. Do not relax this
-// for half_size: non-Bayer/linear DNG layouts may ignore that request and still
-// allocate at full resolution. Ticket #173 replaces the fixed limit with tiled
-// decode and device-class budgeting.
-constexpr uint64_t kMaxFullDecodePixels =
-    sizeof(void*) >= 8 ? 12ULL * 1024ULL * 1024ULL
-                       : 8ULL * 1024ULL * 1024ULL;
+// Non-Bayer/linear DNG layouts may ignore half_size. Use the same selected
+// limit for all phases of one decode, including its post-unpack checks.
+uint64_t currentDecodePixelLimit() {
+    uint64_t totalBytes = 0;
+    uint64_t availableBytes = 0;
+#ifdef __ANDROID__
+    // MemAvailable accounts for reclaimable cache; sysconf(_SC_AVPHYS_PAGES)
+    // only reports free pages and would reject otherwise capable devices.
+    FILE* file = std::fopen("/proc/meminfo", "r");
+    if (file != nullptr) {
+        char line[128];
+        while (std::fgets(line, sizeof(line), file) != nullptr) {
+            unsigned long long kib = 0;
+            if (std::sscanf(line, "MemTotal: %llu kB", &kib) == 1) {
+                totalBytes = static_cast<uint64_t>(kib) * 1024ULL;
+            } else if (std::sscanf(line, "MemAvailable: %llu kB", &kib) == 1) {
+                availableBytes = static_cast<uint64_t>(kib) * 1024ULL;
+            }
+        }
+        std::fclose(file);
+    }
+#endif
+    return decodePixelLimitForMemory(sizeof(void*) >= 8,
+                                     totalBytes, availableBytes);
+}
 
 bool cancellationRequested(const DecodeOptions& options) {
     return options.cancelFlag != nullptr &&
@@ -1231,7 +1248,7 @@ bool stretchedDimensionsExceedLimit(const libraw_image_sizes_t& sizes,
 }
 
 bool declaredDecodeDimensionsExceedLimit(const LibRaw& raw,
-                                         const DecodeOptions&) {
+                                         uint64_t pixelLimit) {
     const auto& sizes = raw.imgdata.sizes;
     // LibRaw::unpack() may expand its raw-store dimensions to include active
     // area margins even when raw_width*raw_height and width*height are each
@@ -1244,20 +1261,20 @@ bool declaredDecodeDimensionsExceedLimit(const LibRaw& raw,
         sizes.raw_height,
         static_cast<uint64_t>(sizes.height) + sizes.top_margin);
     return pixelProductExceeds(sizes.raw_width, sizes.raw_height,
-                               kMaxFullDecodePixels) ||
+                               pixelLimit) ||
            pixelProductExceeds(sizes.width, sizes.height,
-                               kMaxFullDecodePixels) ||
+                               pixelLimit) ||
            pixelProductExceeds(allocationWidth, allocationHeight,
-                               kMaxFullDecodePixels) ||
-           stretchedDimensionsExceedLimit(sizes, kMaxFullDecodePixels);
+                               pixelLimit) ||
+           stretchedDimensionsExceedLimit(sizes, pixelLimit);
 }
 
-DecodeResult dimensionLimitFailure(const DecodeOptions&) {
+DecodeResult dimensionLimitFailure(uint64_t pixelLimit) {
     DecodeResult result;
     result.status = SFRAW_ERR_NO_MEMORY;
-    result.error = sizeof(void*) >= 8
-        ? "RAW geometry exceeds 12 MiPixel in-memory safety limit"
-        : "RAW geometry exceeds 8 MiPixel in-memory safety limit";
+    result.error = "RAW geometry exceeds " +
+        std::to_string(pixelLimit / (1024ULL * 1024ULL)) +
+        " MiPixel in-memory safety limit for available device RAM";
     return result;
 }
 
@@ -2109,7 +2126,8 @@ void applyParityParams(LibRaw& raw, const DecodeOptions& options) {
 DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
                           const uint8_t* srcData, size_t srcLen,
                           std::chrono::steady_clock::time_point decodeStartedAt,
-                          double inputIoMs, double openMs) {
+                          double inputIoMs, double openMs,
+                          uint64_t pixelLimit) {
     DecodeResult result;
 
     if (cancellationRequested(options)) return cancellationFailure();
@@ -2183,8 +2201,8 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
     // Some loaders finalize or replace image geometry during unpack(). Re-run
     // the same overflow-safe raw/visible/margin/aspect guard before any
     // dcraw_process() allocation instead of trusting identify-time dimensions.
-    if (declaredDecodeDimensionsExceedLimit(raw, options)) {
-        return dimensionLimitFailure(options);
+    if (declaredDecodeDimensionsExceedLimit(raw, pixelLimit)) {
+        return dimensionLimitFailure(pixelLimit);
     }
     const dngsniff::PrimaryImageInfo finalizedSource =
         dngsniff::primaryImageInfoOf(srcData, srcLen,
@@ -2269,8 +2287,8 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
     if (fullW <= 0 || fullH <= 0 ||
         pixelProductExceeds(static_cast<uint64_t>(fullW),
                             static_cast<uint64_t>(fullH),
-                            kMaxFullDecodePixels)) {
-        return dimensionLimitFailure(options);
+                            pixelLimit)) {
+        return dimensionLimitFailure(pixelLimit);
     }
     const std::size_t fullPixels =
         static_cast<std::size_t>(fullW) * static_cast<std::size_t>(fullH);
@@ -2382,6 +2400,7 @@ DecodeResult finishDecode(LibRaw& raw, const DecodeOptions& options,
 DecodeResult decodeFromBuffer(const uint8_t* data, size_t length,
                               const DecodeOptions& options) try {
     const auto decodeStartedAt = std::chrono::steady_clock::now();
+    const uint64_t pixelLimit = currentDecodePixelLimit();
     DecodeResult result;
     if (!rawWhiteBalanceOptionsValid(options)) {
         return invalidWhiteBalanceFailure();
@@ -2421,11 +2440,11 @@ DecodeResult decodeFromBuffer(const uint8_t* data, size_t length,
                        libraw_strerror(rc) + " (unsupported or corrupt RAW)";
         return result;
     }
-    if (declaredDecodeDimensionsExceedLimit(raw, options)) {
-        return dimensionLimitFailure(options);
+    if (declaredDecodeDimensionsExceedLimit(raw, pixelLimit)) {
+        return dimensionLimitFailure(pixelLimit);
     }
     return finishDecode(raw, options, data, length, decodeStartedAt, 0.0,
-                        openMs);
+                        openMs, pixelLimit);
 } catch (const std::bad_alloc&) {
     DecodeResult result;
     result.status = SFRAW_ERR_NO_MEMORY;
@@ -2440,6 +2459,7 @@ DecodeResult decodeFromBuffer(const uint8_t* data, size_t length,
 
 DecodeResult decodeFromFd(int fd, const DecodeOptions& options) try {
     const auto decodeStartedAt = std::chrono::steady_clock::now();
+    const uint64_t pixelLimit = currentDecodePixelLimit();
     DecodeResult result;
     if (!rawWhiteBalanceOptionsValid(options)) {
         return invalidWhiteBalanceFailure();
@@ -2527,11 +2547,11 @@ DecodeResult decodeFromFd(int fd, const DecodeOptions& options) try {
                        libraw_strerror(rc) + " (unsupported or corrupt RAW)";
         return result;
     }
-    if (declaredDecodeDimensionsExceedLimit(raw, options)) {
-        return dimensionLimitFailure(options);
+    if (declaredDecodeDimensionsExceedLimit(raw, pixelLimit)) {
+        return dimensionLimitFailure(pixelLimit);
     }
     return finishDecode(raw, options, bytes.data(), bytes.size(),
-                        decodeStartedAt, inputIoMs, openMs);
+                        decodeStartedAt, inputIoMs, openMs, pixelLimit);
 } catch (const std::bad_alloc&) {
     DecodeResult result;
     result.status = SFRAW_ERR_NO_MEMORY;

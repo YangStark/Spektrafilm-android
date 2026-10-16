@@ -42,13 +42,13 @@ android {
     buildToolsVersion = "36.0.0"
 
     defaultConfig {
-        applicationId = "com.spectrafilm.app"
+        applicationId = "com.spectrafilm.app.local"
         minSdk = 24
         targetSdk = 36
-        versionCode = 12
-        versionName = "0.10.0"
+        versionCode = 13
+        versionName = "0.10.0-local.2"
         testInstrumentationRunner = "com.spectrafilm.app.ReleaseCandidateSmokeInstrumentation"
-        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
+        ndk { abiFilters += providers.gradleProperty("localAbis").orElse("arm64-v8a,armeabi-v7a,x86_64").get().split(",") }
     }
 
     signingConfigs {

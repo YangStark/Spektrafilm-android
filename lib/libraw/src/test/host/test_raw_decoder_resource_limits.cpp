@@ -3,6 +3,7 @@
  * Copyright (C) 2026 Spektrafilm Android contributors. GPLv3.
  */
 #include "public_api_test_support.h"
+#include "raw_decode_budget.h"
 #include "raw_decoder.h"
 
 #include <libraw/libraw.h>
@@ -46,6 +47,26 @@ std::string describe(const spectrafilm::DecodeResult& result) {
 }  // namespace
 
 int main() {
+  constexpr std::uint64_t kMiB = 1024ULL * 1024ULL;
+  constexpr std::uint64_t kGiB = 1024ULL * kMiB;
+  check(spectrafilm::decodePixelLimitForMemory(false, 16 * kGiB,
+                                                12 * kGiB) == 8 * kMiB,
+        "32-bit decoder keeps the 8 MiPixel ceiling");
+  check(spectrafilm::decodePixelLimitForMemory(true, 8 * kGiB,
+                                                3 * kGiB) == 32 * kMiB &&
+            spectrafilm::decodePixelLimitForMemory(true, 8 * kGiB,
+                                                     3 * kGiB - 1) == 24 * kMiB,
+        "32 MiPixel tier requires both memory thresholds");
+  check(spectrafilm::decodePixelLimitForMemory(true, 6 * kGiB,
+                                                2 * kGiB) == 24 * kMiB &&
+            spectrafilm::decodePixelLimitForMemory(true, 6 * kGiB - 1,
+                                                     2 * kGiB) == 12 * kMiB &&
+            spectrafilm::decodePixelLimitForMemory(true, 6 * kGiB,
+                                                     2 * kGiB - 1) == 12 * kMiB,
+        "24 MiPixel tier requires both memory thresholds");
+  check(spectrafilm::decodePixelLimitForMemory(true, 0, 0) == 12 * kMiB,
+        "unavailable memory telemetry falls back to 12 MiPixels");
+
   spectrafilm::DecodeOptions options;
 
   std::atomic<bool> preCancelled{true};

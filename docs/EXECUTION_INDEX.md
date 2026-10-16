@@ -145,3 +145,21 @@ Performance claims must name the source commit/artifact, device and OS, workload
 route/effects/format, cold or warm state, sample count, statistic (at least median or p50/p95), and
 uncertainty. A historical result without those fields stays historical and cannot satisfy a release
 SLO.
+
+## Local RAW compatibility build (2026-10-15)
+
+Local test version: `0.10.0-local.1` / versionCode `12`, based on the unmodified v0.10.0 tag (`d7f9fcf86213c9dc46d2a2b5ddfa41dc8040ef0e`). Application ID `com.spectrafilm.app.local` allows installation beside the official release. This is not an upstream release.
+
+The RAW decode geometry ceiling is now selected once per decode from pointer width and Android MemTotal/MemAvailable: 32-bit remains 8 MiPixels; 64-bit defaults to 12 MiPixels, admits 24 MiPixels with at least 6 GiB total / 2 GiB available, and 32 MiPixels with at least 8 GiB total / 3 GiB available. Encoded input, raw-store, overflow, cancellation, and post-unpack checks remain in place. Film simulation math is unchanged.
+
+`-PlocalAbis=arm64-v8a` builds only the tested device ABI; omission retains all upstream ABIs. The local package uses the public development key via the existing optional keystore.properties mechanism. Do not represent that key as a production release identity.
+
+## Local GPU large-frame build (2026-10-15)
+
+Local test version: `0.10.0-local.2` / versionCode `13`. Grain uses bounded row slices with finite blur halos and global RNG coordinates. Halation/DIR retain full-line IIR processing, with three 128 MiB descriptor windows per logical work buffer, capped working set and unchanged shared memory admission. Grain seam tests and 6064x4040 spatial GPU-vs-CPU checks are required in addition to host parity. Safe CPU fallback remains enabled for unsupported parameters or memory pressure.
+
+Large spatial scratch is released after the final fenced readback so it cannot retain approximately 1.1 GiB of the process budget during export-result allocation. Pipelines remain reusable; subsequent calls recreate buffers and update their descriptors before dispatch.
+
+Local validation on Galaxy S24+ (SM-S926U1, Snapdragon 8 Gen 3 / Adreno 750, Android 16, arm64): both 44-test host parity legs passed (`-O2` and shipping fast-math flags), as did device grain seam/statistical tests, halation tests, and the 6064x4040 GPU spatial comparison plus scratch-release assertion. The large-frame comparison measured log10(raw) max_abs 6.186e-7 and RMS 1.113e-8. Release build, APK signature verification, and docs consistency passed. RAW budget policy boundary assertions passed independently on arm64; the complete LibRaw host resource suite was not rerun.
+
+Twenty distinct 24.5 MP Nikon Z f NEFs were exported at full resolution across the local validation sessions. The final 18-photo interactive batch used one persistent process, JPEG quality 95 / sRGB / CCTF, with halation, DIR, and grain GPU engagement confirmed for every export. Application-reported end-to-end time was 14.635-15.572 s (median 14.8835 s); selection, transfer, and UI wait time are excluded. This is a warm-process, single-device sample, not a temperature-controlled benchmark or all-preset qualification. All 18 transferred JPEGs passed full decode, geometry, and SHA256 checks. Personal photos, device logs, APKs, local SDK paths, and signing configuration are intentionally outside version control.
