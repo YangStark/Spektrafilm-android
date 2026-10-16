@@ -176,6 +176,11 @@ bool halation_scatter(const HalationScatterRequest&, double*,
 #include "gpu/glare_spv.h"
 #include "gpu/grain_spv.h"
 #include "gpu/halation_scatter_spv.h"
+// The original five-binding shader keeps small frames available on devices
+// whose per-stage storage descriptor limit is below thirteen.
+static const uint32_t kHalationScatterLegacySpv[] =
+#include "gpu/halation_scatter_legacy_spv.inc"
+;
 #include "kernels/parallel.h"
 #include "gpu/printing_spv.h"
 #include "gpu/scan_spectral_chain_spv.h"
@@ -325,6 +330,7 @@ struct Ctx {
         Buf frame;                         // FrameFloats (binding 27)
         std::array<ResidentBuf, 4> work{}; // src, sum, x, xT (device-local preferred)
         bool pipelineReady = false;
+        bool segmented = false;
     } halation;
 
     struct PointwiseChain {
@@ -389,8 +395,8 @@ struct Ctx {
 
     void destroyBuf(Buf& b) {
         if (b.mapped) { vkUnmapMemory(device, b.mem); b.mapped = nullptr; }
-        if (b.mem) { vkFreeMemory(device, b.mem, nullptr); b.mem = VK_NULL_HANDLE; }
         if (b.buf) { vkDestroyBuffer(device, b.buf, nullptr); b.buf = VK_NULL_HANDLE; }
+        if (b.mem) { vkFreeMemory(device, b.mem, nullptr); b.mem = VK_NULL_HANDLE; }
         b.cap = 0;
         b.reservation.reset();
     }
@@ -1738,11 +1744,8 @@ bool scan_spectral_linear(const float* cmy, float* rgb, uint32_t npix,
 }
 
 // --- AgX particle grain sampler (#214) --------------------------------------
-// One dispatch over the whole frame. NOT sliced, unlike dispatch_scan above:
-// the per-particle dye-cloud blur reads neighbours, and a sliced upload would
-// need a halo at every seam. The 2D grid comes from the same planner the
-// pointwise chain uses, so a frame larger than 65535 workgroups still goes in
-// one submission.
+// Whole-row slices carry the dye-cloud halo. Full-image coordinates preserve
+// reflected edges and counter-based RNG across every slice boundary.
 namespace {
 
 // std430 push constant; must match grain.comp's Push block exactly.
@@ -1753,6 +1756,8 @@ struct GrainPush {
     uint32_t groups_x;
     uint32_t width;
     uint32_t height;
+    uint32_t input_pixel_base;
+    uint32_t output_pixel_base;
 };
 
 constexpr uint32_t kGrainCellStride = 16u;   // floats per cell, matches CELL_STRIDE
@@ -1863,20 +1868,29 @@ bool grain_sample(const GrainSampleRequest& request, float* out_rgb,
     const VkPhysicalDeviceLimits& limits = c.properties.limits;
     Ctx::Kernel& s = c.grainK;
 
-    const PointwiseDispatchGrid grid =
-        plan_pointwise_dispatch(request.npix, limits.maxComputeWorkGroupCount[0],
-                                limits.maxComputeWorkGroupCount[1]);
-    if (!grid.valid) return give_up("dispatch-too-large");
-
-    const VkDeviceSize inBytes =
-        static_cast<VkDeviceSize>(request.npix) * ncells * sizeof(float);
-    const VkDeviceSize outBytes =
-        static_cast<VkDeviceSize>(request.npix) * 3u * sizeof(float);
+    // Bounded whole-row uploads include the full finite blur halo. RNG and
+    // reflection use full-image coordinates, so slicing cannot change a draw.
+    const VkDeviceSize cap = std::min<VkDeviceSize>(32ULL * 1024 * 1024,
+                                                   limits.maxStorageBufferRange);
+    const VkDeviceSize inputRowBytes = static_cast<VkDeviceSize>(request.width) * ncells * sizeof(float);
+    const VkDeviceSize outputRowBytes = static_cast<VkDeviceSize>(request.width) * 3u * sizeof(float);
+    const uint64_t inputRowsCap = cap / inputRowBytes;
+    if (inputRowsCap <= 2u * maxRadius || cap / outputRowBytes == 0)
+        return give_up("row-too-large");
+    uint32_t rowsPerSlice = static_cast<uint32_t>(std::min<uint64_t>(request.height,
+        std::min<uint64_t>(inputRowsCap - 2u * maxRadius, cap / outputRowBytes)));
+    if (request.max_slice_rows > 0)
+        rowsPerSlice = std::min(rowsPerSlice, request.max_slice_rows);
+    const VkDeviceSize inBytes = std::min<uint64_t>(request.height,
+        static_cast<uint64_t>(rowsPerSlice) + 2u * maxRadius) * inputRowBytes;
+    const VkDeviceSize outBytes = static_cast<VkDeviceSize>(rowsPerSlice) * outputRowBytes;
     const VkDeviceSize cellBytes =
         static_cast<VkDeviceSize>(kGrainMaxCells) * kGrainCellStride * sizeof(float);
-    const VkDeviceSize counterBytes = 16;      // one uint, padded
-    if (inBytes > limits.maxStorageBufferRange || outBytes > limits.maxStorageBufferRange)
-        return give_up("buffer-too-large");
+    const VkDeviceSize counterBytes = 16;
+    // Preserve the public failure contract: no partial slice reaches out_rgb.
+    std::vector<float> completed;
+    try { completed.resize(static_cast<size_t>(request.npix) * 3u); }
+    catch (const std::bad_alloc&) { return give_up("allocation-failed"); }
 
     // Every early exit here used to land on the single reason "dispatch-failed",
     // which is exactly what a real 12.5 MP export reported -- with gpu_ms = 0.0,
@@ -1887,15 +1901,14 @@ bool grain_sample(const GrainSampleRequest& request, float* out_rgb,
     const char* why = "dispatch-failed";
     do {
         if (!s.pipelineReady &&
-            !build_scan_pipeline(c, s, kGrainSpv, sizeof(kGrainSpv))) {
+            !build_scan_pipeline(c, s, kGrainSpv, sizeof(kGrainSpv), sizeof(GrainPush))) {
             why = "pipeline-failed";
             break;
         }
 
         const bool hadIn = s.in.cap >= inBytes && s.in.buf;
         const bool hadOut = s.out.cap >= outBytes && s.out.buf;
-        // The input alone is npix * ncells * 4 -- 449 MB at 12.5 MP with nine
-        // cells, asked for next to the diffusion transform's own scratch.
+        // Slice buffers remain bounded even for full-resolution camera frames.
         why = "allocation-failed";
         if (!c.ensureBuf(s.in, inBytes)) break;
         if (!c.ensureBuf(s.out, outBytes)) break;
@@ -1920,78 +1933,92 @@ bool grain_sample(const GrainSampleRequest& request, float* out_rgb,
         }
         std::memcpy(s.dyeB.mapped, cellData.data(), static_cast<size_t>(cellBytes));
 
-        const size_t nin = static_cast<size_t>(request.npix) * ncells;
-        const size_t nout = static_cast<size_t>(request.npix) * 3u;
+        bool allSlicesOk = true;
+        for (uint32_t y = 0; y < request.height; y += rowsPerSlice) {
+            const uint32_t rows = std::min(rowsPerSlice, request.height - y);
+            const uint32_t inputY = y > maxRadius ? y - maxRadius : 0;
+            const uint32_t inputEnd = static_cast<uint32_t>(std::min<uint64_t>(request.height,
+                static_cast<uint64_t>(y) + rows + maxRadius));
+            const size_t nin = static_cast<size_t>(inputEnd - inputY) * request.width * ncells;
+            const size_t nout = static_cast<size_t>(rows) * request.width * 3u;
+            const PointwiseDispatchGrid grid = plan_pointwise_dispatch(rows * request.width,
+                limits.maxComputeWorkGroupCount[0], limits.maxComputeWorkGroupCount[1]);
+            if (!grid.valid) { why = "dispatch-too-large"; allSlicesOk = false; break; }
 
-        // Upload, and guard non-finite densities here rather than in the shader:
-        // clamp(NaN) is implementation-defined in GLSL, so shader NaN behaviour
-        // must never decide a pixel. The CPU sampler yields zero grain for a
-        // non-finite density (fast_poisson_one rejects a NaN rate), and density
-        // 0 is the closest finite stand-in.
-        const auto t_up = std::chrono::steady_clock::now();
-        {
-            float* dst = static_cast<float*>(s.in.mapped);
-            const float* src = request.density_cells;
-            parallel_for(0, static_cast<int>(nin), [&](int lo, int hi) {
-                for (int i = lo; i < hi; ++i) {
-                    const float v = src[i];
-                    dst[i] = std::isfinite(v) ? v : 0.0f;
-                }
-            });
-        }
-        const uint32_t zero = 0;
-        std::memcpy(s.cmfB.mapped, &zero, sizeof(uint32_t));
-        d.upload_ms = std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - t_up).count();
+            // Upload, and guard non-finite densities here rather than in the shader:
+            // clamp(NaN) is implementation-defined in GLSL, so shader NaN behaviour
+            // must never decide a pixel. The CPU sampler yields zero grain for a
+            // non-finite density (fast_poisson_one rejects a NaN rate), and density
+            // 0 is the closest finite stand-in.
+            const auto t_up = std::chrono::steady_clock::now();
+            {
+                float* dst = static_cast<float*>(s.in.mapped);
+                const float* src = request.density_cells + static_cast<size_t>(inputY) * request.width * ncells;
+                parallel_for(0, static_cast<int>(nin), [&](int lo, int hi) {
+                    for (int i = lo; i < hi; ++i) {
+                        const float v = src[i];
+                        dst[i] = std::isfinite(v) ? v : 0.0f;
+                    }
+                });
+            }
+            const uint32_t zero = 0;
+            std::memcpy(s.cmfB.mapped, &zero, sizeof(uint32_t));
+            d.upload_ms += std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t_up).count();
 
-        GrainPush push{};
-        push.npix = request.npix;
-        push.ncells = ncells;
-        push.seed_offset = request.seed_offset;
-        push.groups_x = grid.groups_x;
-        push.width = request.width;
-        push.height = request.height;
+            GrainPush push{};
+            push.npix = rows * request.width;
+            push.input_pixel_base = inputY * request.width;
+            push.output_pixel_base = y * request.width;
+            push.ncells = ncells;
+            push.seed_offset = request.seed_offset;
+            push.groups_x = grid.groups_x;
+            push.width = request.width;
+            push.height = request.height;
 
-        const auto t_gpu = std::chrono::steady_clock::now();
-        bool dispatch_ok = true;
-        do {
-            if (vkResetCommandBuffer(s.cmd, 0) != VK_SUCCESS) { dispatch_ok = false; break; }
-            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            if (vkBeginCommandBuffer(s.cmd, &bi) != VK_SUCCESS) { dispatch_ok = false; break; }
-            vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipe);
-            vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.pl, 0, 1,
-                                    &s.dset, 0, nullptr);
-            vkCmdPushConstants(s.cmd, s.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                               sizeof(GrainPush), &push);
-            vkCmdDispatch(s.cmd, grid.groups_x, grid.groups_y, 1);
-            if (vkEndCommandBuffer(s.cmd) != VK_SUCCESS) { dispatch_ok = false; break; }
+            const auto t_gpu = std::chrono::steady_clock::now();
+            bool dispatch_ok = true;
+            do {
+                if (vkResetCommandBuffer(s.cmd, 0) != VK_SUCCESS) { dispatch_ok = false; break; }
+                VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                if (vkBeginCommandBuffer(s.cmd, &bi) != VK_SUCCESS) { dispatch_ok = false; break; }
+                vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipe);
+                vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.pl, 0, 1,
+                                        &s.dset, 0, nullptr);
+                vkCmdPushConstants(s.cmd, s.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                   sizeof(GrainPush), &push);
+                vkCmdDispatch(s.cmd, grid.groups_x, grid.groups_y, 1);
+                if (vkEndCommandBuffer(s.cmd) != VK_SUCCESS) { dispatch_ok = false; break; }
 
-            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-            si.commandBufferCount = 1;
-            si.pCommandBuffers = &s.cmd;
-            if (vkQueueSubmit(c.queue, 1, &si, s.fence) != VK_SUCCESS) { dispatch_ok = false; break; }
-            if (vkWaitForFences(c.device, 1, &s.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) { dispatch_ok = false; break; }
-            if (vkResetFences(c.device, 1, &s.fence) != VK_SUCCESS) { dispatch_ok = false; break; }
-        } while (false);
-        d.gpu_ms = std::chrono::duration<double, std::milli>(
-                       std::chrono::steady_clock::now() - t_gpu).count();
-        if (!dispatch_ok) break;
-        d.slices = 1;
+                VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                si.commandBufferCount = 1;
+                si.pCommandBuffers = &s.cmd;
+                if (vkQueueSubmit(c.queue, 1, &si, s.fence) != VK_SUCCESS) { dispatch_ok = false; break; }
+                if (vkWaitForFences(c.device, 1, &s.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) { dispatch_ok = false; break; }
+                if (vkResetFences(c.device, 1, &s.fence) != VK_SUCCESS) { dispatch_ok = false; break; }
+            } while (false);
+            d.gpu_ms += std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t_gpu).count();
+            if (!dispatch_ok) { allSlicesOk = false; break; }
+            ++d.slices;
 
-        const auto t_back = std::chrono::steady_clock::now();
-        {
-            const float* outp = static_cast<const float*>(s.out.mapped);
-            parallel_for(0, static_cast<int>(nout), [&](int lo, int hi) {
-                std::memcpy(out_rgb + lo, outp + lo,
-                            static_cast<size_t>(hi - lo) * sizeof(float));
-            });
-            uint32_t got = 0;
-            std::memcpy(&got, s.cmfB.mapped, sizeof(uint32_t));
-            d.out_of_branch = got;
-        }
-        d.readback_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t_back).count();
+            const auto t_back = std::chrono::steady_clock::now();
+            {
+                const float* outp = static_cast<const float*>(s.out.mapped);
+                parallel_for(0, static_cast<int>(nout), [&](int lo, int hi) {
+                    std::memcpy(completed.data() + static_cast<size_t>(y) * request.width * 3u + lo, outp + lo,
+                                static_cast<size_t>(hi - lo) * sizeof(float));
+                });
+                uint32_t got = 0;
+                std::memcpy(&got, s.cmfB.mapped, sizeof(uint32_t));
+                d.out_of_branch += got;
+            }
+            d.readback_ms += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_back).count();
+        } // row slices
+        if (!allSlicesOk) break;
+        std::memcpy(out_rgb, completed.data(), completed.size() * sizeof(float));
         ok = true;
     } while (false);
 
@@ -3501,31 +3528,36 @@ constexpr double kHalTailAmplitude[3] = {0.1633, 0.6496, 0.1870};
 constexpr double kHalTailRatio[3] = {0.5360, 1.5236, 2.7684};
 constexpr uint32_t kHalSetCount = 11u;
 constexpr VkDeviceSize kHalPixelBytes = 12;      // three f32, packed
+// Each storage descriptor exposes at most 128 MiB, the Vulkan minimum
+// maxStorageBufferRange. The four physical buffers remain whole-frame so
+// transfers and the full-line IIR recursion retain their original layout.
+constexpr VkDeviceSize kHalSegmentBytes = 128ull << 20;
+constexpr uint32_t kHalSegmentCount = 3u;
 constexpr uint32_t kHalWorkBuffers = 4u;         // src, sum, x, xT
-// Whole-frame residency ceiling for the four work buffers (48 B/px: ~22 MP).
-// Above it the pass refuses and the CPU runs; bringing back row bands with the
-// IIR state carried through host-side storage is the upgrade path if a larger
-// export ever needs the GPU pass.
-constexpr VkDeviceSize kHalWorkBudgetBytes = 1024ull << 20;
+// Whole-frame residency remains bounded: four work buffers at 48 B/px,
+// up to 1.5 GiB including the 24.5 MP export. The process memory budget
+// still admits each actual Vulkan allocation or falls back to the CPU.
+constexpr VkDeviceSize kHalWorkBudgetBytes = 1536ull << 20;
 constexpr VkDeviceSize kHalStagingBytes = 64ull << 20;  // upload/readback band
 constexpr uint32_t kHalGroupX = 32u, kHalGroupY = 8u;
 constexpr uint32_t kHalSrc = 0u, kHalSum = 1u, kHalX = 2u, kHalXT = 3u;
 
-bool build_halation_pipeline(Ctx& c, Ctx::HalationKernel& k) {
+bool build_halation_pipeline(Ctx& c, Ctx::HalationKernel& k, bool segmented) {
     VkShaderModuleCreateInfo smci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    smci.codeSize = sizeof(kHalationScatterSpv);
-    smci.pCode = kHalationScatterSpv;
+    smci.codeSize = segmented ? sizeof(kHalationScatterSpv) : sizeof(kHalationScatterLegacySpv);
+    smci.pCode = segmented ? kHalationScatterSpv : kHalationScatterLegacySpv;
     if (vkCreateShaderModule(c.device, &smci, nullptr, &k.shader) != VK_SUCCESS) return false;
-    const uint32_t bindingIds[5] = {0u, 1u, 2u, 3u, 27u};
-    VkDescriptorSetLayoutBinding b[5]{};
-    for (uint32_t i = 0; i < 5; ++i) {
-        b[i].binding = bindingIds[i];
+    // Three fixed descriptor windows per logical work buffer, plus FrameFloats.
+    const uint32_t bindingCount = segmented ? 13u : 5u;
+    VkDescriptorSetLayoutBinding b[13]{};
+    for (uint32_t i = 0; i < bindingCount; ++i) {
+        b[i].binding = i == bindingCount - 1u ? 27u : i;
         b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dlci.bindingCount = 5;
+    dlci.bindingCount = bindingCount;
     dlci.pBindings = b;
     if (vkCreateDescriptorSetLayout(c.device, &dlci, nullptr, &k.dsl) != VK_SUCCESS) return false;
     if (sizeof(HalationPush) > c.properties.limits.maxPushConstantsSize) return false;
@@ -3543,7 +3575,7 @@ bool build_halation_pipeline(Ctx& c, Ctx::HalationKernel& k) {
     cpci.stage.pName = "main";
     cpci.layout = k.pl;
     if (vkCreateComputePipelines(c.device, VK_NULL_HANDLE, 1, &cpci, nullptr, &k.pipe) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5u * kHalSetCount};
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, bindingCount * kHalSetCount};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = kHalSetCount;
     dpci.poolSizeCount = 1;
@@ -3568,6 +3600,7 @@ bool build_halation_pipeline(Ctx& c, Ctx::HalationKernel& k) {
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vkCreateFence(c.device, &fci, nullptr, &k.fence) != VK_SUCCESS) return false;
     k.pipelineReady = true;
+    k.segmented = segmented;
     return true;
 }
 
@@ -3586,7 +3619,7 @@ bool build_halation_pipeline(Ctx& c, Ctx::HalationKernel& k) {
 //   8 transpose XT -> S     9 Y accumulate S -> SUM (scratch XT)
 //  10 resolve (X, SUM) -> S
 // Unused bindings of a set hold a buffer the op never touches.
-void write_halation_sets(Ctx& c, Ctx::HalationKernel& k) {
+void write_halation_sets(Ctx& c, Ctx::HalationKernel& k, VkDeviceSize frameBytes) {
     const VkBuffer S = k.work[kHalSrc].buf, SUM = k.work[kHalSum].buf,
                    X = k.work[kHalX].buf, XT = k.work[kHalXT].buf;
     const VkBuffer roles[kHalSetCount][4] = {
@@ -3594,16 +3627,28 @@ void write_halation_sets(Ctx& c, Ctx::HalationKernel& k) {
         {S, SUM, S, S},   {S, SUM, S, X},   {X, S, X, X},    {X, XT, X, X},
         {XT, S, XT, XT},  {S, SUM, S, XT},  {X, SUM, X, S},
     };
-    std::array<VkDescriptorBufferInfo, kHalSetCount * 5> infos{};
-    std::array<VkWriteDescriptorSet, kHalSetCount * 5> writes{};
+    const uint32_t bindingCount = k.segmented ? 13u : 5u;
+    std::array<VkDescriptorBufferInfo, kHalSetCount * 13> infos{};
+    std::array<VkWriteDescriptorSet, kHalSetCount * 13> writes{};
     size_t n = 0;
     for (uint32_t s = 0; s < kHalSetCount; ++s) {
-        const uint32_t bindingIds[5] = {0u, 1u, 2u, 3u, 27u};
-        for (uint32_t i = 0; i < 5; ++i) {
-            infos[n] = VkDescriptorBufferInfo{i < 4 ? roles[s][i] : k.frame.buf, 0, VK_WHOLE_SIZE};
+        for (uint32_t i = 0; i < bindingCount; ++i) {
+            if (i == bindingCount - 1u) {
+                infos[n] = VkDescriptorBufferInfo{k.frame.buf, 0, VK_WHOLE_SIZE};
+            } else if (!k.segmented) {
+                infos[n] = VkDescriptorBufferInfo{roles[s][i], 0, frameBytes};
+            } else {
+                const VkDeviceSize offset = static_cast<VkDeviceSize>(i % kHalSegmentCount) * kHalSegmentBytes;
+                // Unused windows still need a valid nonzero descriptor range.
+                // Their shader branches are unreachable for this frame size.
+                infos[n] = offset < frameBytes
+                    ? VkDescriptorBufferInfo{roles[s][i / kHalSegmentCount], offset,
+                                             std::min(kHalSegmentBytes, frameBytes - offset)}
+                    : VkDescriptorBufferInfo{roles[s][i / kHalSegmentCount], 0, sizeof(float)};
+            }
             writes[n] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             writes[n].dstSet = k.dsets[s];
-            writes[n].dstBinding = bindingIds[i];
+            writes[n].dstBinding = i == bindingCount - 1u ? 27u : i;
             writes[n].descriptorCount = 1;
             writes[n].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[n].pBufferInfo = &infos[n];
@@ -3734,14 +3779,23 @@ bool halation_scatter_locked(Ctx& c, const HalationScatterRequest& r, double* ou
     }
     if (!(sigmaMax <= kHalMaxSigma)) { d.reason = "sigma-too-large"; return false; }
 
-    // Whole-frame residency: four packed f32 planes, each one storage range,
-    // against the fixed budget and the device's largest device-local heap.
+    // Whole-frame residency: four packed f32 planes, each exposed through
+    // three bounded storage ranges, against the fixed work ceiling and heap.
     const uint32_t W = static_cast<uint32_t>(r.width), H = static_cast<uint32_t>(r.height);
     const VkDeviceSize frameBytes = static_cast<VkDeviceSize>(npix64) * kHalPixelBytes;
     const VkDeviceSize workBytes = frameBytes * kHalWorkBuffers;
     const VkPhysicalDeviceLimits& lim = c.properties.limits;
     const uint32_t maxDim = std::max(W, H);
-    if (workBytes > kHalWorkBudgetBytes || frameBytes > lim.maxStorageBufferRange ||
+    const bool segmented = frameBytes > lim.maxStorageBufferRange;
+    if ((segmented && (lim.maxPerStageDescriptorStorageBuffers < 13u ||
+        lim.maxDescriptorSetStorageBuffers < 13u || lim.maxPerStageResources < 13u ||
+        kHalSegmentBytes % lim.minStorageBufferOffsetAlignment != 0 ||
+        lim.maxStorageBufferRange < kHalSegmentBytes)) ||
+        (!segmented && (lim.maxPerStageDescriptorStorageBuffers < 5u ||
+        lim.maxDescriptorSetStorageBuffers < 5u || lim.maxPerStageResources < 5u ||
+        frameBytes > lim.maxStorageBufferRange)) ||
+        frameBytes > kHalSegmentBytes * kHalSegmentCount ||
+        workBytes > kHalWorkBudgetBytes ||
         workBytes > c.largestHeapFor(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
         (maxDim + kHalLineThreads - 1u) / kHalLineThreads > lim.maxComputeWorkGroupCount[0] ||
         (maxDim + kHalTransposeTile - 1u) / kHalTransposeTile >
@@ -3760,7 +3814,8 @@ bool halation_scatter_locked(Ctx& c, const HalationScatterRequest& r, double* ou
     const VkDeviceSize stagingBytes = static_cast<VkDeviceSize>(bandRows) * rowBytes;
 
     Ctx::HalationKernel& k = c.halation;
-    if (!k.pipelineReady && !build_halation_pipeline(c, k)) { d.reason = "pipeline-failed"; return false; }
+    if (k.pipelineReady && k.segmented != segmented) c.destroyHalation();
+    if (!k.pipelineReady && !build_halation_pipeline(c, k, segmented)) { d.reason = "pipeline-failed"; return false; }
     if (!c.ensureBuf(k.staging, stagingBytes)) { d.reason = "allocation-failed"; return false; }
     if (!c.ensureBuf(k.frame, kHalFrameFloatCount * sizeof(float))) { d.reason = "allocation-failed"; return false; }
     PointwiseChainDiagnostics scratchDiagnostics{};
@@ -3907,7 +3962,7 @@ bool halation_scatter_locked(Ctx& c, const HalationScatterRequest& r, double* ou
             for (uint32_t b = 0; b < static_cast<uint32_t>(bounces); ++b) fill(4u + b, kHalSigmaBounce, b);
         }
     }
-    write_halation_sets(c, k);
+    write_halation_sets(c, k, frameBytes);
     HalationPush push{};
     push.fullWidth = W;
     push.fullHeight = H;
@@ -4091,6 +4146,14 @@ bool halation_scatter_locked(Ctx& c, const HalationScatterRequest& r, double* ou
     d.bands = bands;
     d.dispatches = dispatches;
     d.resident = resident;
+    // Every submission, including the final copy, has completed here. Large
+    // export scratch must not occupy the process budget during JNI result and
+    // writer allocation. Keep pipelines and small preview buffers warm; the
+    // next large call recreates scratch and rewrites every descriptor above.
+    if (frameBytes > kHalSegmentBytes) {
+        for (ResidentBuf& buffer : k.work) c.destroyResidentBuf(buffer);
+        c.destroyBuf(k.staging);
+    }
     return true;
 }
 

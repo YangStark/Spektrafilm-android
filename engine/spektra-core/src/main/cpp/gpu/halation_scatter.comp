@@ -106,22 +106,48 @@ const uint kBlurFieldFirRadius = 11u;
 // finite if the table is ever wrong.
 const int kMaxFirRadius = 256;
 
-// Packed float triples: element (pixel, channel) is at pixel * 3 + channel.
-layout(std430, binding = 0) readonly buffer Input0 {
-  float in0[];
-};
+// Packed float triples remain one linear array in each physical VkBuffer. The
+// twelve descriptors are non-overlapping 128 MiB windows; explicit branches
+// avoid requiring dynamic descriptor indexing on mobile Vulkan devices.
+const uint kSegmentFloats = 33554432u;
+layout(std430, binding = 0) readonly buffer Input00 { float in00[]; };
+layout(std430, binding = 1) readonly buffer Input01 { float in01[]; };
+layout(std430, binding = 2) readonly buffer Input02 { float in02[]; };
+layout(std430, binding = 3) buffer Buffer10 { float buf10[]; };
+layout(std430, binding = 4) buffer Buffer11 { float buf11[]; };
+layout(std430, binding = 5) buffer Buffer12 { float buf12[]; };
+layout(std430, binding = 6) readonly buffer Input20 { float in20[]; };
+layout(std430, binding = 7) readonly buffer Input21 { float in21[]; };
+layout(std430, binding = 8) readonly buffer Input22 { float in22[]; };
+layout(std430, binding = 9) buffer Buffer30 { float buf30[]; };
+layout(std430, binding = 10) buffer Buffer31 { float buf31[]; };
+layout(std430, binding = 11) buffer Buffer32 { float buf32[]; };
 
-layout(std430, binding = 1) buffer Buffer1 {
-  float buf1[];
-};
-
-layout(std430, binding = 2) readonly buffer Input2 {
-  float in2[];
-};
-
-layout(std430, binding = 3) buffer Buffer3 {
-  float buf3[];
-};
+float loadIn0(uint i) {
+  if (i < kSegmentFloats) return in00[i];
+  if (i < 2u * kSegmentFloats) return in01[i - kSegmentFloats];
+  return in02[i - 2u * kSegmentFloats];
+}
+float loadBuf1(uint i) {
+  if (i < kSegmentFloats) return buf10[i];
+  if (i < 2u * kSegmentFloats) return buf11[i - kSegmentFloats];
+  return buf12[i - 2u * kSegmentFloats];
+}
+void storeBuf1(uint i, float v) {
+  if (i < kSegmentFloats) buf10[i] = v;
+  else if (i < 2u * kSegmentFloats) buf11[i - kSegmentFloats] = v;
+  else buf12[i - 2u * kSegmentFloats] = v;
+}
+float loadBuf3(uint i) {
+  if (i < kSegmentFloats) return buf30[i];
+  if (i < 2u * kSegmentFloats) return buf31[i - kSegmentFloats];
+  return buf32[i - 2u * kSegmentFloats];
+}
+void storeBuf3(uint i, float v) {
+  if (i < kSegmentFloats) buf30[i] = v;
+  else if (i < 2u * kSegmentFloats) buf31[i - kSegmentFloats] = v;
+  else buf32[i - 2u * kSegmentFloats] = v;
+}
 
 layout(std430, binding = 27) readonly buffer FrameFloats {
   float frameFloats[];
@@ -300,24 +326,24 @@ uint columnElement(uint line, uint j, uint c) {
 void iirColumnInPlace(uint line, uint n, uint slot, uint c) {
   const Coeff B = loadCoeff(slot, c, kBlurFieldB), p1 = loadCoeff(slot, c, kBlurFieldP1),
               p2 = loadCoeff(slot, c, kBlurFieldP2), p3 = loadCoeff(slot, c, kBlurFieldP3);
-  DF w1 = DF(buf1[columnElement(line, 0u, c)], 0.0);
+  DF w1 = DF(loadBuf1(columnElement(line, 0u, c)), 0.0);
   DF w2 = w1;
   DF w3 = w1;
   for (uint j = 0u; j < n; ++j) {
     const uint idx = columnElement(line, j, c);
-    const DF v = iirStep(B, p1, p2, p3, buf1[idx], w1, w2, w3);
-    buf1[idx] = v.hi;
+    const DF v = iirStep(B, p1, p2, p3, loadBuf1(idx), w1, w2, w3);
+    storeBuf1(idx, v.hi);
     w3 = w2;
     w2 = w1;
     w1 = v;
   }
-  DF y1 = DF(buf1[columnElement(line, n - 1u, c)], 0.0);
+  DF y1 = DF(loadBuf1(columnElement(line, n - 1u, c)), 0.0);
   DF y2 = y1;
   DF y3 = y1;
   for (int jj = int(n) - 1; jj >= 0; --jj) {
     const uint idx = columnElement(line, uint(jj), c);
-    const DF y = iirStep(B, p1, p2, p3, buf1[idx], y1, y2, y3);
-    buf1[idx] = y.hi;
+    const DF y = iirStep(B, p1, p2, p3, loadBuf1(idx), y1, y2, y3);
+    storeBuf1(idx, y.hi);
     y3 = y2;
     y2 = y1;
     y1 = y;
@@ -329,24 +355,24 @@ void iirColumnInPlace(uint line, uint n, uint slot, uint c) {
 void iirColumnAccumulate(uint line, uint n, uint slot, uint c, float weight) {
   const Coeff B = loadCoeff(slot, c, kBlurFieldB), p1 = loadCoeff(slot, c, kBlurFieldP1),
               p2 = loadCoeff(slot, c, kBlurFieldP2), p3 = loadCoeff(slot, c, kBlurFieldP3);
-  DF w1 = DF(in0[columnElement(line, 0u, c)], 0.0);
+  DF w1 = DF(loadIn0(columnElement(line, 0u, c)), 0.0);
   DF w2 = w1;
   DF w3 = w1;
   for (uint j = 0u; j < n; ++j) {
     const uint idx = columnElement(line, j, c);
-    const DF v = iirStep(B, p1, p2, p3, in0[idx], w1, w2, w3);
-    buf3[idx] = v.hi;
+    const DF v = iirStep(B, p1, p2, p3, loadIn0(idx), w1, w2, w3);
+    storeBuf3(idx, v.hi);
     w3 = w2;
     w2 = w1;
     w1 = v;
   }
-  DF y1 = DF(buf3[columnElement(line, n - 1u, c)], 0.0);
+  DF y1 = DF(loadBuf3(columnElement(line, n - 1u, c)), 0.0);
   DF y2 = y1;
   DF y3 = y1;
   for (int jj = int(n) - 1; jj >= 0; --jj) {
     const uint idx = columnElement(line, uint(jj), c);
-    const DF y = iirStep(B, p1, p2, p3, buf3[idx], y1, y2, y3);
-    buf1[idx] = buf1[idx] + weight * y.hi;
+    const DF y = iirStep(B, p1, p2, p3, loadBuf3(idx), y1, y2, y3);
+    storeBuf1(idx, loadBuf1(idx) + weight * y.hi);
     y3 = y2;
     y2 = y1;
     y1 = y;
@@ -360,7 +386,7 @@ void iirColumnAccumulate(uint line, uint n, uint slot, uint c, float weight) {
 float firPixel(uvec2 gid, uint c, float sigma, int radius, bool alongX) {
   const int x = int(gid.x);
   const int y = int(gid.y);
-  const float centre = in0[(gid.y * params.width + gid.x) * 3u + c];
+  const float centre = loadIn0((gid.y * params.width + gid.x) * 3u + c);
   if (radius <= 0) {
     return centre;
   }
@@ -377,7 +403,7 @@ float firPixel(uvec2 gid, uint c, float sigma, int radius, bool alongX) {
     const int hi = reflectIndex(p + k, n);
     const uint loIdx = alongX ? uint(y) * params.width + uint(lo) : uint(lo) * params.width + uint(x);
     const uint hiIdx = alongX ? uint(y) * params.width + uint(hi) : uint(hi) * params.width + uint(x);
-    acc += (in0[loIdx * 3u + c] + in0[hiIdx * 3u + c]) * g;
+    acc += (loadIn0(loIdx * 3u + c) + loadIn0(hiIdx * 3u + c)) * g;
     weightSum += 2.0 * g;
     g *= ratio;
     ratio *= ratioStep;
@@ -399,9 +425,9 @@ void transposeTile() {
     const uint y = group.y * 32u + local.y + k * 8u;
     if (x < params.width && y < params.height) {
       const uint idx = (y * params.width + x) * 3u;
-      tile[0][local.y + k * 8u][local.x] = in0[idx];
-      tile[1][local.y + k * 8u][local.x] = in0[idx + 1u];
-      tile[2][local.y + k * 8u][local.x] = in0[idx + 2u];
+      tile[0][local.y + k * 8u][local.x] = loadIn0(idx);
+      tile[1][local.y + k * 8u][local.x] = loadIn0(idx + 1u);
+      tile[2][local.y + k * 8u][local.x] = loadIn0(idx + 2u);
     }
   }
   barrier();
@@ -410,9 +436,9 @@ void transposeTile() {
     const uint ty = group.x * 32u + local.y + k * 8u;  // transposed y = original x
     if (tx < params.height && ty < params.width) {
       const uint idx = (ty * params.height + tx) * 3u;
-      if ((mask & 1u) != 0u) buf1[idx] = tile[0][local.x][local.y + k * 8u];
-      if ((mask & 2u) != 0u) buf1[idx + 1u] = tile[1][local.x][local.y + k * 8u];
-      if ((mask & 4u) != 0u) buf1[idx + 2u] = tile[2][local.x][local.y + k * 8u];
+      if ((mask & 1u) != 0u) storeBuf1(idx, tile[0][local.x][local.y + k * 8u]);
+      if ((mask & 2u) != 0u) storeBuf1(idx + 1u, tile[1][local.x][local.y + k * 8u]);
+      if ((mask & 4u) != 0u) storeBuf1(idx + 2u, tile[2][local.x][local.y + k * 8u]);
     }
   }
 }
@@ -455,32 +481,32 @@ void main() {
     for (uint c = 0u; c < 3u; ++c) {
       if (!blurIsIir(slot, c)) {
         const float v = firPixel(gid, c, blurSigma(slot, c), blurFirRadius(slot, c), alongX);
-        buf1[index + c] = alongX ? v : buf1[index + c] + blurWeight(slot, c) * v;
+        storeBuf1(index + c, alongX ? v : loadBuf1(index + c) + blurWeight(slot, c) * v);
       }
     }
     return;
   }
   if (params.operation == kOpClear) {
-    buf1[index] = 0.0;
-    buf1[index + 1u] = 0.0;
-    buf1[index + 2u] = 0.0;
+    storeBuf1(index, 0.0);
+    storeBuf1(index + 1u, 0.0);
+    storeBuf1(index + 2u, 0.0);
     return;
   }
   if (params.operation == kOpScatterResolve) {
     // raw = (1 - s) * raw + s * scattered, scattered already folded in buf1
-    const vec3 raw = vec3(in0[index], in0[index + 1u], in0[index + 2u]);
-    const vec3 scattered = vec3(buf1[index], buf1[index + 1u], buf1[index + 2u]);
+    const vec3 raw = vec3(loadIn0(index), loadIn0(index + 1u), loadIn0(index + 2u));
+    const vec3 scattered = vec3(loadBuf1(index), loadBuf1(index + 1u), loadBuf1(index + 2u));
     const float amount = f(kFrameScatterAmount);
     const vec3 resolved = (1.0 - amount) * raw + amount * scattered;
-    buf3[index] = resolved.r;
-    buf3[index + 1u] = resolved.g;
-    buf3[index + 2u] = resolved.b;
+    storeBuf3(index, resolved.r);
+    storeBuf3(index + 1u, resolved.g);
+    storeBuf3(index + 2u, resolved.b);
     return;
   }
   if (params.operation == kOpBounceResolveRaw) {
     // raw = raw + a_tot * halation_blur ; if renormalize: raw /= (1 + a_tot)
-    const vec3 raw = vec3(in0[index], in0[index + 1u], in0[index + 2u]);
-    const vec3 blur = vec3(buf1[index], buf1[index + 1u], buf1[index + 2u]);
+    const vec3 raw = vec3(loadIn0(index), loadIn0(index + 1u), loadIn0(index + 2u));
+    const vec3 blur = vec3(loadBuf1(index), loadBuf1(index + 1u), loadBuf1(index + 2u));
     // a_tot = halation_strength * halation_amount, exactly as
     // model/diffusion.cpp forms it: no clamp, because the CPU pass this must
     // stay within tolerance of does not clamp either.
@@ -493,8 +519,8 @@ void main() {
     if (f(kFrameHalationRenormalize) > 0.5) {
       resolved /= (vec3(1.0) + amount);
     }
-    buf3[index] = resolved.r;
-    buf3[index + 1u] = resolved.g;
-    buf3[index + 2u] = resolved.b;
+    storeBuf3(index, resolved.r);
+    storeBuf3(index + 1u, resolved.g);
+    storeBuf3(index + 2u, resolved.b);
   }
 }

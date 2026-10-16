@@ -26,6 +26,7 @@ $pairs = @(
     @('printing.comp', 'printing_spv.inc'),
     @('scan_spectral_chain.comp', 'scan_spectral_chain_spv.inc'),
     @('halation_scatter.comp', 'halation_scatter_spv.inc'),
+    @('halation_scatter_legacy.comp', 'halation_scatter_legacy_spv.inc'),
     @('grain.comp', 'grain_spv.inc'),
     @('glare.comp', 'glare_spv.inc'),
     @('fft_convolve.comp', 'fft_convolve_spv.inc'),
